@@ -80,6 +80,7 @@ let textSource (data:DataSource) =
 // Sequential model
 
 type Computation = Variable -> DeviceDescriptor -> Function
+type Computation2 = Variable -> DeviceDescriptor -> Function * Function
 type ComputationWithInput = DeviceDescriptor -> Function
 
 
@@ -97,6 +98,9 @@ let evaluation (loss:Loss) (predicted:Function, actual:Variable) =
     | SquaredError -> 
         CNTKLib.SquaredError(new Variable(predicted),actual)
 
+type LearningType =
+    | SGDLearner
+    | MomentumSGDLearner
 
 type Specification = {
     Features: Variable
@@ -104,6 +108,7 @@ type Specification = {
     Model: Computation
     Loss: Loss
     Eval: Loss
+    LearningType: LearningType
     }
 
 type Schedule = {
@@ -125,6 +130,21 @@ let learning (predictor:Function) (schedule:Schedule) =
         ResizeArray<Learner>(
             [ 
                 Learner.SGDLearner(predictor.Parameters(), learningRatePerSample) 
+            ])
+    parameterLearners
+
+let learningWithMomentum (predictor:Function) (schedule:Schedule) = 
+    let learningRatePerSample = 
+        new TrainingParameterScheduleDouble(schedule.Rate, uint32 schedule.MinibatchSize)
+    let momentumTimeConstant = CNTKLib.MomentumAsTimeConstantSchedule(256.)    
+    let parameterLearners =
+        ResizeArray<Learner>(
+            [
+                Learner.MomentumSGDLearner(
+                    predictor.Parameters(),
+                    learningRatePerSample,
+                    momentumTimeConstant,
+                    true) // unitGainMomentum
             ])
     parameterLearners
 
@@ -176,7 +196,11 @@ type Learner () =
         let loss = evaluation spec.Loss (predictor,spec.Labels)
         let eval = evaluation spec.Eval (predictor,spec.Labels)   
 
-        let parameterLearners = learning predictor config.Schedule     
+        let parameterLearners = 
+            match spec.LearningType with
+            | SGDLearner -> learning predictor config.Schedule     
+            | MomentumSGDLearner -> learningWithMomentum predictor config.Schedule
+
         let trainer = Trainer.CreateTrainer(predictor, loss, eval, parameterLearners)
         
         let input = spec.Features
@@ -286,7 +310,216 @@ module Layer =
     let dropout (proba:float) : Computation = 
         fun input ->
             fun device ->
-                CNTKLib.Dropout(input,proba)
+                CNTKLib.Dropout(input,proba)     
+
+    let embedding(embeddingDim:int) : Computation =
+        fun input ->
+            fun device ->
+                let inputDim = input.Shape.[0]
+                let dataType = input.DataType
+                let embeddingParameters = 
+                    new Parameter(
+                        shape [ embeddingDim; inputDim ], 
+                        dataType, 
+                        CNTKLib.GlorotUniformInitializer(), 
+                        device
+                        )
+                CNTKLib.Times(embeddingParameters, input)
+
+    let stabilize<'ElementType> : Computation =
+        fun input ->
+            fun device ->
+                let isFloatType = (typeof<'ElementType> = typeof<System.Single>)
+                
+                let f, fInv =
+                    if (isFloatType)
+                    then
+                        Constant.Scalar(4.0f, device),
+                        Constant.Scalar(DataType.Float,  1.0 / 4.0) 
+                    else
+                        Constant.Scalar(4.0, device),
+                        Constant.Scalar(DataType.Double, 1.0 / 4.0)
+                    
+                let beta = 
+                    CNTKLib.ElementTimes(
+                        fInv,
+                        new Variable(
+                            CNTKLib.Log(
+                                new Variable(
+                                    Constant.Scalar(f.DataType, 1.0) +  
+                                    new Variable(
+                                        CNTKLib.Exp(
+                                            new Variable(
+                                                CNTKLib.ElementTimes(f, new Parameter(new NDShape(), f.DataType, 0.99537863, device))
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                
+                CNTKLib.ElementTimes(new Variable(beta), input)
+
+    let LSTMPCellWithSelfStabilization<'ElementType> (prevOutput:Variable) (prevCellState:Variable) : Computation2 =
+        fun input ->
+            fun device ->
+                let outputDim = prevOutput.Shape.[0]
+                let cellDim = prevCellState.Shape.[0]
+                
+                let isFloatType = (typeof<'ElementType> = typeof<System.Single>)
+
+                let dataType : DataType = 
+                    if isFloatType 
+                    then DataType.Float 
+                    else DataType.Double
+
+                let createBiasParam : int -> Parameter =
+                    match dataType with
+                    | DataType.Float -> fun dim -> new Parameter(shape [ dim ], 0.01f, device, "")
+                    | DataType.Double -> fun dim -> new Parameter(shape [ dim ], 0.01, device, "")
+                    | _ -> failwith "not implemented"
+
+                // TODO: replace by a function...
+                let seeder =
+                    let mutable s = uint32 1
+                    fun () ->
+                        s <- s + uint32 1
+                        s
+
+                let createProjectionParam : int -> Parameter = 
+                    fun oDim -> 
+                        new Parameter(
+                            shape [ oDim; NDShape.InferredDimension ],
+                            dataType, 
+                            CNTKLib.GlorotUniformInitializer(1.0, 1, 0, seeder ()), 
+                            device
+                            )
+                
+                let createDiagWeightParam : int -> Parameter = 
+                    fun dim ->
+                        new Parameter(
+                            shape [ dim ], 
+                            dataType, 
+                            CNTKLib.GlorotUniformInitializer(1.0, 1, 0, seeder ()), 
+                            device
+                            )
+
+                let stabilizedPrevOutput : Function = stabilize<'ElementType> prevOutput device
+                let stabilizedPrevCellState : Function = stabilize<'ElementType> prevCellState device
+
+                let projectInput : unit -> Variable = 
+                    fun () -> new Variable(createBiasParam (cellDim) + new Variable(createProjectionParam(cellDim) * input))
+
+                // holy lambdas this is nasty
+                // Input gate
+                let it : Function =
+                    CNTKLib.Sigmoid(
+                        new Variable(
+                            new Variable(projectInput () + new Variable((createProjectionParam (cellDim) * new Variable(stabilizedPrevOutput)))) 
+                            + new Variable(CNTKLib.ElementTimes(createDiagWeightParam (cellDim), new Variable(stabilizedPrevCellState)))
+                            )
+                        )
+                        
+                let bit : Function = 
+                    CNTKLib.ElementTimes(
+                        new Variable(it),
+                        new Variable(
+                            CNTKLib.Tanh(
+                                new Variable(projectInput () + new Variable(createProjectionParam(cellDim) * new Variable(stabilizedPrevOutput)))
+                                )
+                            )
+                        )
+
+                // Forget-me-not gate
+                let ft : Function = 
+                    CNTKLib.Sigmoid(
+                        new Variable(
+                            projectInput () + 
+                            new Variable(
+                                new Variable(createProjectionParam(cellDim) * new Variable(stabilizedPrevOutput)) +
+                                new Variable(
+                                    CNTKLib.ElementTimes(createDiagWeightParam(cellDim), new Variable(stabilizedPrevCellState))
+                                    )
+                                )
+                            )
+                        )
+                            
+                let bft : Function = CNTKLib.ElementTimes(new Variable(ft), prevCellState)
+
+                let ct : Function = new Variable(bft) + new Variable(bit)
+
+                // Output gate
+                let ot : Function = 
+                    CNTKLib.Sigmoid(
+                        new Variable(
+                            new Variable (
+                                projectInput () + new Variable(createProjectionParam(cellDim) * new Variable(stabilizedPrevOutput))) + 
+                            new Variable (
+                                CNTKLib.ElementTimes(
+                                    createDiagWeightParam(cellDim), 
+                                    new Variable(stabilize<'ElementType> (new Variable(ct)) device)
+                                    )
+                                )
+                            )
+                        )
+                
+                let ht : Function = CNTKLib.ElementTimes(new Variable(ot), new Variable(CNTKLib.Tanh(new Variable(ct))))
+
+                let c : Function = ct
+                let h : Function = 
+                    if (outputDim <> cellDim) 
+                    then (createProjectionParam(outputDim) * new Variable(stabilize<'ElementType> (new Variable(ht)) device))
+                    else ht
+
+                (h, c)            
+            
+    let LSTMPComponentWithSelfStabilization<'ElementType> (outputShape:NDShape) (cellShape:NDShape) (recurrenceHookH:Variable -> Function) (recurrenceHookC:Variable -> Function) : Computation2 =
+        fun input ->
+            fun device ->
+                let dh = Variable.PlaceholderVariable(outputShape, input.DynamicAxes)
+                let dc = Variable.PlaceholderVariable(cellShape, input.DynamicAxes)
+
+                let LSTMCell = LSTMPCellWithSelfStabilization<'ElementType> dh dc input device
+                let actualDh = recurrenceHookH (new Variable(fst LSTMCell))
+                let actualDc = recurrenceHookC (new Variable(snd LSTMCell))
+
+                // TODO check this, seems to involve some mutation
+                // Form the recurrence loop by replacing the dh and dc placeholders with the actualDh and actualDc
+                let replacement : IDictionary<Variable, Variable> =
+                    [
+                        dh, new Variable(actualDh)
+                        dc, new Variable(actualDc)
+                    ]
+                    |> dict
+
+                (fst LSTMCell).ReplacePlaceholders(replacement) |> ignore
+
+                LSTMCell
+
+    /// <summary>
+    /// Build a one direction recurrent neural network (RNN) with long-short-term-memory (LSTM) cells.
+    /// http://colah.github.io/posts/2015-08-Understanding-LSTMs/
+    /// </summary>
+    /// <param name="input">the input variable</param>
+    /// <param name="numOutputClasses">number of output classes</param>
+    /// <param name="embeddingDim">dimension of the embedding layer</param>
+    /// <param name="LSTMDim">LSTM output dimension</param>
+    /// <param name="cellDim">cell dimension</param>
+    /// <param name="device">CPU or GPU device to run the model</param>
+    /// <param name="outputName">name of the model output</param>
+    /// <returns>the RNN model</returns>
+    let LSTMSequenceClassifierNet (numOutputClasses:int) (embeddingDim:int) (LSTMDim:int) (cellDim:int) =
+        fun input ->
+            fun device ->
+                let embeddingFunction : Function = embedding embeddingDim input device
+                let pastValueRecurrenceHook : (Variable -> Function) = fun x -> CNTKLib.PastValue(x)
+                let (LSTMFunction:Function), _ = 
+                    LSTMPComponentWithSelfStabilization<single> (shape [ LSTMDim ]) (shape [ cellDim ]) pastValueRecurrenceHook pastValueRecurrenceHook (new Variable(embeddingFunction)) device
+
+                let thoughtVectorFunction : Function = CNTKLib.SequenceLast(new Variable(LSTMFunction))
+
+                dense numOutputClasses (new Variable(thoughtVectorFunction)) device
 
 [<RequireQualifiedAccess>]
 module Activation = 

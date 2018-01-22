@@ -65,6 +65,7 @@ let spec = {
     Model = network
     Loss = CrossEntropyWithSoftmax
     Eval = ClassificationError
+    LearningType = SGDLearner
     }
 
 // learning
