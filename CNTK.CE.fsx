@@ -80,9 +80,11 @@ let textSource (data:DataSource) =
 // Sequential model
 
 type Computation = Variable -> DeviceDescriptor -> Function
+type ComputationWithoutInput = DeviceDescriptor -> Function
 type Computation2 = Variable -> DeviceDescriptor -> Function * Function
-type ComputationWithInput = DeviceDescriptor -> Function
-
+type Computation2WithoutInput = DeviceDescriptor -> Function * Function
+type ComputationVariable = Variable -> DeviceDescriptor -> Variable
+type ComputationVariableWithoutInput = DeviceDescriptor -> Variable
 
 type Loss = 
     | CrossEntropyWithSoftmax
@@ -251,19 +253,50 @@ module Layer =
         member this.Bind(m:Computation, f:Variable -> Computation) : Computation =
             fun input -> fun device -> f (new Variable(m input device)) input device
 
-        member this.Bind(m:ComputationWithInput, f:Variable -> Computation) : Computation =
+        member this.Bind(m:ComputationWithoutInput, f:Variable -> Computation) : Computation =
             fun input -> fun device -> f (new Variable(m device)) input device
+
+        member this.Bind(m:Computation2, f:Variable * Variable -> Computation) : Computation =
+            fun input -> fun device -> let func1, func2 = m input device in f (new Variable(func1), new Variable(func2)) input device
+
+        member this.Bind(m:Computation2WithoutInput, f:Variable * Variable -> Computation) : Computation =
+            fun input -> fun device -> let func1, func2 = m device in f (new Variable(func1), new Variable(func2)) input device  
+
+        member this.Bind(m:Function, f:Variable -> Computation) : Computation =
+            fun input -> fun device -> f (new Variable(m)) input device        
 
         member this.Return(x:Variable) : Computation = fun input -> fun device -> x.ToFunction()
 
     let computation = ComputationBuilder()
+
+    type Computation2Builder() =
+
+        member this.Bind(m:Computation2, f:Variable * Variable -> Computation2) : Computation2 =
+            fun input -> fun device -> let func1, func2 = m input device in f (new Variable(func1), new Variable(func2)) input device
+
+        member this.Bind(m:Computation2WithoutInput, f:Variable * Variable -> Computation2) : Computation2 =
+            fun input -> fun device -> let func1, func2 = m device in f (new Variable(func1), new Variable(func2)) input device
+
+        member this.Bind(m:ComputationVariable, f:Variable -> Computation2) : Computation2 =
+            fun input -> fun device -> f (m input device) input device
+
+        member this.Bind(m:ComputationVariableWithoutInput, f:Variable -> Computation2) : Computation2 =
+            fun input -> fun device -> f (m device) input device       
+
+        member this.Bind(m:Function, f:Variable -> Computation2) : Computation2 =
+            fun input -> fun device -> f (new Variable(m)) input device        
+
+        member this.Return(x:Variable*Variable) : Computation2 = fun input -> fun device -> ((fst x).ToFunction(), (snd x).ToFunction())
+
+    let computation2 = Computation2Builder()
     
     // Combine 2 Computation Layers into 1
     let stack (next:Computation) (curr:Computation) : Computation =
-        fun input ->
-            fun device ->
-                let intermediate = new Variable(curr input device)
-                next intermediate device
+        computation {
+            let! intermediate = curr
+            let! result = next intermediate
+            return result 
+        }
 
     // combine a sequence of Computation Layers into 1
     let sequence (computations: Computation seq) =
@@ -474,28 +507,33 @@ module Layer =
 
                 (h, c)            
             
-    let LSTMPComponentWithSelfStabilization<'ElementType> (outputShape:NDShape) (cellShape:NDShape) (recurrenceHookH:Variable -> Function) (recurrenceHookC:Variable -> Function) : Computation2 =
+    let placeholderVariable (shape:NDShape) : ComputationVariable =
         fun input ->
             fun device ->
-                let dh = Variable.PlaceholderVariable(outputShape, input.DynamicAxes)
-                let dc = Variable.PlaceholderVariable(cellShape, input.DynamicAxes)
+                Variable.PlaceholderVariable(shape, input.DynamicAxes)
 
-                let LSTMCell = LSTMPCellWithSelfStabilization<'ElementType> dh dc input device
-                let actualDh = recurrenceHookH (new Variable(fst LSTMCell))
-                let actualDc = recurrenceHookC (new Variable(snd LSTMCell))
+    let LSTMPComponentWithSelfStabilization<'ElementType> (outputShape:NDShape) (cellShape:NDShape) (recurrenceHookH:Variable -> Function) (recurrenceHookC:Variable -> Function) : Computation2 =
+        computation2 {
+            let! dh = placeholderVariable outputShape
+            let! dc = placeholderVariable cellShape
 
-                // TODO check this, seems to involve some mutation
-                // Form the recurrence loop by replacing the dh and dc placeholders with the actualDh and actualDc
-                let replacement : IDictionary<Variable, Variable> =
-                    [
-                        dh, new Variable(actualDh)
-                        dc, new Variable(actualDc)
-                    ]
-                    |> dict
+            let! LSTMCell = LSTMPCellWithSelfStabilization<'ElementType> dh dc
+            let! actualDh = recurrenceHookH (fst LSTMCell)
+            let! actualDc = recurrenceHookC (snd LSTMCell)
 
-                (fst LSTMCell).ReplacePlaceholders(replacement) |> ignore
+            // TODO check this, seems to involve some mutation
+            // Form the recurrence loop by replacing the dh and dc placeholders with the actualDh and actualDc
+            let replacement : IDictionary<Variable, Variable> =
+                [
+                    dh, actualDh
+                    dc, actualDc
+                ]
+                |> dict
 
-                LSTMCell
+            (fst LSTMCell).ToFunction().ReplacePlaceholders(replacement) |> ignore
+
+            return LSTMCell 
+        }
 
     /// <summary>
     /// Build a one direction recurrent neural network (RNN) with long-short-term-memory (LSTM) cells.
@@ -510,16 +548,15 @@ module Layer =
     /// <param name="outputName">name of the model output</param>
     /// <returns>the RNN model</returns>
     let LSTMSequenceClassifierNet (numOutputClasses:int) (embeddingDim:int) (LSTMDim:int) (cellDim:int) =
-        fun input ->
-            fun device ->
-                let embeddingFunction : Function = embedding embeddingDim input device
-                let pastValueRecurrenceHook : (Variable -> Function) = fun x -> CNTKLib.PastValue(x)
-                let (LSTMFunction:Function), _ = 
-                    LSTMPComponentWithSelfStabilization<single> (shape [ LSTMDim ]) (shape [ cellDim ]) pastValueRecurrenceHook pastValueRecurrenceHook (new Variable(embeddingFunction)) device
+        computation {
+            let! embedding = embedding embeddingDim
+            let pastValueRecurrenceHook : (Variable -> Function) = fun x -> CNTKLib.PastValue(x)
+            let! LSTM, _ = LSTMPComponentWithSelfStabilization<single> (shape [ LSTMDim ]) (shape [ cellDim ]) pastValueRecurrenceHook pastValueRecurrenceHook embedding
+            let! thoughtVector = CNTKLib.SequenceLast(LSTM)
+            let! dense = dense numOutputClasses thoughtVector
 
-                let thoughtVectorFunction : Function = CNTKLib.SequenceLast(new Variable(LSTMFunction))
-
-                dense numOutputClasses (new Variable(thoughtVectorFunction)) device
+            return dense
+        }
 
 [<RequireQualifiedAccess>]
 module Activation = 
